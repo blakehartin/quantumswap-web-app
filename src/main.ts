@@ -46,6 +46,7 @@ function registerRoutes(): void {
     // The front page is the swap panel (swap-only landing).
     .add("/", swapView, { theme: "violet" })
     .add("swap", swapView, { theme: "violet" })
+    .add("swap/:from/:to", swapView, { theme: "violet" })
     .add("pools", poolsView, { theme: "nebula" })
     .add("pools/add", addLiquidityView, { theme: "nebula" })
     .add("pools/add/:tokenA/:tokenB", addLiquidityView, { theme: "nebula" })

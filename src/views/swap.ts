@@ -4,7 +4,7 @@
  */
 
 import { clear, el } from "../ui/dom";
-import type { ViewResult } from "../ui/router";
+import type { RouteContext, ViewResult } from "../ui/router";
 import { approvalStep, errText, statRow } from "./shared";
 import { createTokenAmountInput } from "../ui/components/tokenAmountInput";
 import { flipIcon, gearIcon } from "../ui/components/icons";
@@ -26,10 +26,11 @@ import {
   encodeRouter,
   encodeWq,
 } from "../lib/contracts";
-import { findToken, toPathAddress } from "../tokens/tokenList";
+import { checkImport, findToken, importToken, toPathAddress } from "../tokens/tokenList";
+import { confirmImportToken } from "../tokens/addWarning";
 import { findBestRoute } from "../lib/routeFinder";
 import { getRegistry } from "../lib/pairRegistry";
-import { parseAmount } from "../lib/sanitize";
+import { parseAmount, sanitizeAddress } from "../lib/sanitize";
 import { formatAmount, formatPrice } from "../lib/format";
 import { deadlineFrom, minWithSlippage } from "../lib/quoteMath";
 import { getLatestBlockTimestamp } from "../lib/extensionProvider";
@@ -38,14 +39,21 @@ import { onTxSettled, recordTx } from "../lib/txStore";
 import { settingsStore } from "../config/settings";
 import { connectWallet, walletStore } from "../wallet/wallet";
 
-export function swapView(): ViewResult {
-  let fromToken: TokenInfo = NATIVE_TOKEN;
-  let toToken: TokenInfo = WQ_TOKEN;
+export function swapView(ctx: RouteContext): ViewResult {
+  const fromParam = (ctx.params.from ?? ctx.query.get("from") ?? "").trim();
+  const toParam = (ctx.params.to ?? ctx.query.get("to") ?? "").trim();
+  let fromToken: TokenInfo = resolveParamSync(fromParam) ?? NATIVE_TOKEN;
+  let toToken: TokenInfo = resolveParamSync(toParam) ?? WQ_TOKEN;
+  // Avoid both sides resolving to the same token; keep the "to" side distinct.
+  if (fromToken.address === toToken.address) {
+    toToken = fromToken.address === WQ_TOKEN.address ? NATIVE_TOKEN : WQ_TOKEN;
+  }
   let quotedOut = 0n;
   let pairMissing = false;
   let routePath: string[] = []; // best multi-hop path from the last successful quote
   let quoteToken = 0; // increments to guard against out-of-order async quotes
   let submitting = false; // locks the CTA while the extension is signing/submitting
+  let routeImportAttempted = false; // gates the deep-link import-once
 
   const detailBox = el("div", { class: "details" });
   const actionBox = el("div", {});
@@ -334,13 +342,58 @@ export function swapView(): ViewResult {
     });
   }
 
+  // Deep-link auto-populate: if from/to were passed in the route but refer to
+  // tokens not yet imported, prompt the user to import (at their own risk) and
+  // only then populate the selector. Runs once, after the wallet connects.
+  function applyFrom(t: TokenInfo): void {
+    if (t.address === toToken.address) return;
+    fromInput.setToken(t);
+    fromToken = t;
+    refreshQuote();
+  }
+  function applyTo(t: TokenInfo): void {
+    if (t.address === fromToken.address) return;
+    toInput.setToken(t);
+    toToken = t;
+    refreshQuote();
+  }
+  function tryRouteImport(): void {
+    if (routeImportAttempted) return;
+    if (walletStore.get().status !== "connected") return;
+    routeImportAttempted = true;
+    void maybeImportFromRoute();
+  }
+  async function maybeImportFromRoute(): Promise<void> {
+    const tasks: { addr: string; apply: (t: TokenInfo) => void }[] = [];
+    if (fromParam && !resolveParamSync(fromParam)) {
+      const a = sanitizeAddress(fromParam);
+      if (a) tasks.push({ addr: a, apply: applyFrom });
+    }
+    if (toParam && !resolveParamSync(toParam)) {
+      const a = sanitizeAddress(toParam);
+      if (a) tasks.push({ addr: a, apply: applyTo });
+    }
+    const imported = new Map<string, TokenInfo>();
+    for (const { addr, apply } of tasks) {
+      let token: TokenInfo | null = imported.get(addr.toLowerCase()) ?? null;
+      if (!token) {
+        token = await importUnrecognized(addr);
+        if (!token) continue;
+        imported.set(addr.toLowerCase(), token);
+      }
+      apply(token);
+    }
+  }
+
   const unsub = walletStore.subscribe(() => {
     fromInput.refreshBalance();
     toInput.refreshBalance();
     renderAction();
+    tryRouteImport();
   });
 
   renderAction();
+  tryRouteImport();
 
   return { node, theme: "violet", title: "Swap", cleanup: () => unsub() };
 }
@@ -360,4 +413,33 @@ function tokenSymbol(pathAddr: string): string {
 
 function shortAddr(addr: string): string {
   return `${addr.slice(0, 6)}\u2026${addr.slice(-4)}`;
+}
+
+/**
+ * Resolve a route/query token param to a known TokenInfo (built-in, imported,
+ * or the native sentinel). Returns null for unrecognized addresses so the
+ * caller can decide whether to prompt for import. Synchronous: only matches
+ * tokens already in the list.
+ */
+function resolveParamSync(param: string): TokenInfo | null {
+  if (!param) return null;
+  const low = param.toLowerCase();
+  if (low === NATIVE_TOKEN.address || low === "native" || low === "q") return NATIVE_TOKEN;
+  const addr = sanitizeAddress(param);
+  if (!addr) return null;
+  return findToken(addr);
+}
+
+/**
+ * Look up an unrecognized token on-chain, show the mandatory "import at your
+ * own risk" acknowledgement, and import it only if the user confirms. Returns
+ * the imported token, or null if lookup failed or the user declined.
+ */
+async function importUnrecognized(addr: string): Promise<TokenInfo | null> {
+  if (walletStore.get().status !== "connected") return null;
+  const check = await checkImport(addr);
+  if (!check.ok || !check.token) return null;
+  const confirmed = await confirmImportToken(check.token);
+  if (!confirmed) return null;
+  return importToken(check.token);
 }
