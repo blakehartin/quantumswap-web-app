@@ -66,6 +66,7 @@ export function swapView(ctx: RouteContext): ViewResult {
     onTokenChange: (t) => {
       fromToken = t;
       refreshQuote();
+      syncUrl();
     },
   });
 
@@ -77,6 +78,7 @@ export function swapView(ctx: RouteContext): ViewResult {
     onTokenChange: (t) => {
       toToken = t;
       refreshQuote();
+      syncUrl();
     },
   });
   toInput.setReadonly(true);
@@ -100,6 +102,7 @@ export function swapView(ctx: RouteContext): ViewResult {
           fromInput.setAmount(prevToAmount, true);
           toInput.setAmount("", true);
           refreshQuote();
+          syncUrl();
         },
       },
     },
@@ -357,6 +360,18 @@ export function swapView(ctx: RouteContext): ViewResult {
     toToken = t;
     refreshQuote();
   }
+  // Reflect the current from/to tokens in the address bar + history so the
+  // browser back button can return to a previous pair. Uses pushState (no
+  // hashchange event), so the live view/amount is not torn down on each change.
+  function syncUrl(): void {
+    const target = `#/swap/${tokenToUrlAddr(fromToken)}/${tokenToUrlAddr(toToken)}`;
+    if (location.hash === target) return;
+    try {
+      history.pushState({ qsSwapRoute: target }, "", target);
+    } catch {
+      /* sandboxed or history unavailable - URL sync is best-effort */
+    }
+  }
   function tryRouteImport(): void {
     if (routeImportAttempted) return;
     if (walletStore.get().status !== "connected") return;
@@ -383,6 +398,10 @@ export function swapView(ctx: RouteContext): ViewResult {
       }
       apply(token);
     }
+    // Sync the URL once after the import flow so a declined/failed import
+    // updates the address bar to match what's actually shown (a single history
+    // entry, not one per applied token).
+    syncUrl();
   }
 
   const unsub = walletStore.subscribe(() => {
@@ -413,6 +432,12 @@ function tokenSymbol(pathAddr: string): string {
 
 function shortAddr(addr: string): string {
   return `${addr.slice(0, 6)}\u2026${addr.slice(-4)}`;
+}
+
+/** Token -> URL segment: the native coin is represented as "native" (not the
+ * "native:Q" sentinel) for clean, shareable deep links. */
+function tokenToUrlAddr(t: TokenInfo): string {
+  return t.isNative ? "native" : t.address;
 }
 
 /**
