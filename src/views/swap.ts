@@ -25,9 +25,10 @@ import {
   WQ_ABI,
   encodeRouter,
   encodeWq,
-  router as routerContract,
 } from "../lib/contracts";
-import { toPathAddress } from "../tokens/tokenList";
+import { findToken, toPathAddress } from "../tokens/tokenList";
+import { findBestRoute } from "../lib/routeFinder";
+import { getRegistry } from "../lib/pairRegistry";
 import { parseAmount } from "../lib/sanitize";
 import { formatAmount, formatPrice } from "../lib/format";
 import { deadlineFrom, minWithSlippage } from "../lib/quoteMath";
@@ -42,6 +43,7 @@ export function swapView(): ViewResult {
   let toToken: TokenInfo = WQ_TOKEN;
   let quotedOut = 0n;
   let pairMissing = false;
+  let routePath: string[] = []; // best multi-hop path from the last successful quote
   let quoteToken = 0; // increments to guard against out-of-order async quotes
   let submitting = false; // locks the CTA while the extension is signing/submitting
 
@@ -128,6 +130,7 @@ export function swapView(): ViewResult {
     clear(detailBox);
     pairMissing = false;
     quotedOut = 0n;
+    routePath = [];
 
     const decimals = fromToken.decimals;
     const amountIn = parseAmount(fromInput.getAmount(), decimals);
@@ -152,22 +155,24 @@ export function swapView(): ViewResult {
       return;
     }
 
-    const path = [toPathAddress(fromToken), toPathAddress(toToken)];
     try {
-      const amounts = (await routerContract().getAmountsOut(amountIn, path)) as unknown as bigint[];
+      const route = await findBestRoute(amountIn, fromToken, toToken, 5);
       if (token !== quoteToken) return;
-      const out = amounts && amounts.length ? BigInt(amounts[amounts.length - 1]) : 0n;
+      if (!route || route.out <= 0n) throw new Error("No route found");
+      routePath = route.path;
+      const out = route.out;
       quotedOut = out;
       toInput.setAmount(formatAmount(out, toToken.decimals, toToken.decimals), true);
 
       const price = Number(formatAmount(out, toToken.decimals, 18)) / Number(formatAmount(amountIn, fromToken.decimals, 18));
       const slippage = settingsStore.get().slippagePercent;
       const minOut = minWithSlippage(out, slippage);
+      const hops = route.path.length - 1;
       clear(detailBox);
       detailBox.appendChild(statRow("Price", `1 ${fromToken.symbol} = ${formatPrice(price)} ${toToken.symbol}`));
       detailBox.appendChild(statRow("Minimum received", `${formatAmount(minOut, toToken.decimals, 6)} ${toToken.symbol}`));
-      detailBox.appendChild(statRow(`LP fee (${(LP_FEE_BPS / 100).toFixed(2)}%)`, `${formatAmount((amountIn * BigInt(LP_FEE_BPS)) / 10000n, fromToken.decimals, 6)} ${fromToken.symbol}`));
-      detailBox.appendChild(statRow("Route", path.map((p) => (p === WQ_ADDRESS ? "WQ" : tokenSymbol(p))).join(" \u203a ")));
+      detailBox.appendChild(statRow(`LP fee (${(LP_FEE_BPS / 100).toFixed(2)}% / hop)`, `${formatAmount((amountIn * BigInt(LP_FEE_BPS)) / 10000n, fromToken.decimals, 6)} ${fromToken.symbol}`));
+      detailBox.appendChild(statRow("Route", `${route.path.map((p) => tokenSymbol(p)).join(" \u203a ")} \u00b7 ${hops} hop${hops > 1 ? "s" : ""}`));
     } catch (err) {
       if (token !== quoteToken) return;
       pairMissing = true;
@@ -284,7 +289,7 @@ export function swapView(): ViewResult {
       run: async (onAccepted) => {
         const slippage = settingsStore.get().slippagePercent;
         const minOut = minWithSlippage(quotedOut, slippage);
-        const path = [toPathAddress(fromToken), toPathAddress(toToken)];
+        const path = routePath.length >= 2 ? [...routePath] : [toPathAddress(fromToken), toPathAddress(toToken)];
         const ts = await getLatestBlockTimestamp();
         const deadline = deadlineFrom(ts);
         let data: string;
@@ -341,5 +346,18 @@ export function swapView(): ViewResult {
 }
 
 function tokenSymbol(pathAddr: string): string {
-  return pathAddr === WQ_ADDRESS ? "WQ" : pathAddr.slice(0, 6);
+  const a = pathAddr.toLowerCase();
+  const known = findToken(a);
+  if (known) return known.symbol;
+  // Fall back to symbols recorded in the pair registry (e.g. discovered pairs
+  // whose tokens the user hasn't imported).
+  for (const rec of getRegistry()) {
+    if (rec.token0.address.toLowerCase() === a) return rec.token0.symbol || shortAddr(a);
+    if (rec.token1.address.toLowerCase() === a) return rec.token1.symbol || shortAddr(a);
+  }
+  return shortAddr(a);
+}
+
+function shortAddr(addr: string): string {
+  return `${addr.slice(0, 6)}\u2026${addr.slice(-4)}`;
 }
