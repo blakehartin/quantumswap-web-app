@@ -34,6 +34,7 @@ import { tokenDetailView } from "./views/tokenDetail";
 import { positionsView } from "./views/positions";
 import { activityView } from "./views/activity";
 import { settingsView } from "./views/settings";
+import { createTokenView } from "./views/createToken";
 import { notFoundView } from "./views/notFound";
 
 function hidePreloader(): void {
@@ -56,6 +57,7 @@ function registerRoutes(): void {
     .add("explore/pools/:pairAddress", pairDetailView, { theme: "cyan" })
     .add("explore/tokens", tokenExplorerView, { theme: "emerald" })
     .add("explore/tokens/:address", tokenDetailView, { theme: "emerald" })
+    .add("tokens/create", createTokenView, { theme: "emerald" })
     .add("positions", positionsView, { theme: "nebula" })
     .add("activity", activityView, { theme: "amber" })
     .add("settings", settingsView, { theme: "amber" })
