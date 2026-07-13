@@ -3,15 +3,14 @@
  * fee + route, pair-missing CTA, approve + swap, and native Q <-> WQ wrap/unwrap.
  */
 
-import qc from "quantumcoin";
 import { clear, el } from "../ui/dom";
 import type { ViewResult } from "../ui/router";
-import { errText, statRow } from "./shared";
+import { approvalStep, errText, statRow } from "./shared";
 import { createTokenAmountInput } from "../ui/components/tokenAmountInput";
 import { flipIcon, gearIcon } from "../ui/components/icons";
 import { openSettingsPopover } from "./settingsPopover";
-import { showToast } from "../ui/components/toast";
 import { trackTxToast } from "../ui/components/txToast";
+import { openTxStepsDialog, type TxStep } from "../ui/components/txSteps";
 import {
   NATIVE_TOKEN,
   WQ_TOKEN,
@@ -24,10 +23,8 @@ import {
   ERC20_ABI,
   ROUTER_ABI,
   WQ_ABI,
-  encodeErc20,
   encodeRouter,
   encodeWq,
-  erc20,
   router as routerContract,
 } from "../lib/contracts";
 import { toPathAddress } from "../tokens/tokenList";
@@ -35,7 +32,7 @@ import { parseAmount } from "../lib/sanitize";
 import { formatAmount, formatPrice } from "../lib/format";
 import { deadlineFrom, minWithSlippage } from "../lib/quoteMath";
 import { getLatestBlockTimestamp } from "../lib/extensionProvider";
-import { sendTx, waitForReceipt } from "../lib/tx";
+import { sendTx, waitForReceiptSuccess } from "../lib/tx";
 import { onTxSettled, recordTx } from "../lib/txStore";
 import { settingsStore } from "../config/settings";
 import { connectWallet, walletStore } from "../wallet/wallet";
@@ -219,7 +216,7 @@ export function swapView(): ViewResult {
     );
   }
 
-  async function doSwap(): Promise<void> {
+  function doSwap(): void {
     const account = walletStore.get().account;
     if (!account) return;
     const amountIn = parseAmount(fromInput.getAmount(), fromToken.decimals);
@@ -227,81 +224,95 @@ export function swapView(): ViewResult {
 
     submitting = true;
     renderAction();
-    try {
-      if (isWrap()) {
-        const amount = fromInput.getAmount();
-        const hash = await sendTx({ to: WQ_ADDRESS, data: encodeWq("deposit", []), value: amountIn, abi: WQ_ABI });
-        recordTx(hash, `Wrap ${amount} Q`);
-        onSubmitted(hash);
-        trackTxToast(hash, "wrap", { pending: "Wrapping", success: "Wrap complete", failure: "Wrap failed" }, `${amount} Q \u2192 WQ`);
-        return;
-      }
-      if (isUnwrap()) {
-        const amount = fromInput.getAmount();
-        const hash = await sendTx({ to: WQ_ADDRESS, data: encodeWq("withdraw", [amountIn]), value: 0n, abi: WQ_ABI });
-        recordTx(hash, `Unwrap ${amount} WQ`);
-        onSubmitted(hash);
-        trackTxToast(hash, "wrap", { pending: "Unwrapping", success: "Unwrap complete", failure: "Unwrap failed" }, `${amount} WQ \u2192 Q`);
-        return;
-      }
-
-      const slippage = settingsStore.get().slippagePercent;
-      const minOut = minWithSlippage(quotedOut, slippage);
-      const path = [toPathAddress(fromToken), toPathAddress(toToken)];
-      const ts = await getLatestBlockTimestamp();
-      const deadline = deadlineFrom(ts);
-
-      // Approvals for non-native inputs.
-      if (!fromToken.isNative) {
-        await ensureApproval(toPathAddress(fromToken), account, amountIn);
-      }
-
-      let data: string;
-      let value = 0n;
-      if (fromToken.isNative) {
-        data = encodeRouter("swapExactETHForTokens", [minOut, path, account, deadline]);
-        value = amountIn;
-      } else if (toToken.isNative) {
-        data = encodeRouter("swapExactTokensForETH", [amountIn, minOut, path, account, deadline]);
-      } else {
-        data = encodeRouter("swapExactTokensForTokens", [amountIn, minOut, path, account, deadline]);
-      }
-
-      const amount = fromInput.getAmount();
-      const outAmount = toInput.getAmount();
-      const hash = await sendTx({ to: ROUTER_ADDRESS, data, value, abi: ROUTER_ABI });
-      recordTx(hash, `Swap ${amount} ${fromToken.symbol} for ${toToken.symbol}`);
-      onSubmitted(hash);
-      trackTxToast(
-        hash,
-        "swap",
-        { pending: "Swapping", success: "Swap complete", failure: "Swap failed" },
-        `${amount} ${fromToken.symbol} \u2192 ${outAmount ? `~${outAmount} ` : ""}${toToken.symbol}`,
-      );
-    } catch (err) {
-      showToast({ kind: "error", title: "Swap failed", message: errText(err), autoDismissMs: 7000 });
-    } finally {
-      submitting = false;
-      renderAction();
-    }
+    openTxStepsDialog({
+      title: isWrap() ? "Wrap" : isUnwrap() ? "Unwrap" : "Swap",
+      buildSteps: () => buildSwapSteps(account, amountIn),
+      onClose: () => {
+        submitting = false;
+        renderAction();
+      },
+    });
   }
 
-  async function ensureApproval(tokenAddr: string, owner: string, amount: bigint): Promise<void> {
-    const allowanceRaw = await erc20(tokenAddr).allowance(owner, ROUTER_ADDRESS);
-    const allowance = typeof allowanceRaw === "bigint" ? allowanceRaw : BigInt(allowanceRaw ?? 0);
-    if (allowance >= amount) return;
-    const symbol = fromToken.symbol;
-    const data = encodeErc20("approve", [ROUTER_ADDRESS, qc.MaxUint256]);
-    const hash = await sendTx({ to: tokenAddr, data, value: 0n, abi: ERC20_ABI });
-    recordTx(hash, `Approve ${symbol}`);
-    trackTxToast(
-      hash,
-      "approve",
-      { pending: `Approving ${symbol}`, success: `${symbol} approved`, failure: `${symbol} approval failed` },
-      "Allow the router to spend your token.",
-    );
-    const receipt = await waitForReceipt(hash);
-    if (!receipt || receipt.status !== 1) throw new Error(`${symbol} approval was not confirmed`);
+  async function buildSwapSteps(account: string, amountIn: bigint): Promise<TxStep[]> {
+    if (isWrap()) {
+      const amount = fromInput.getAmount();
+      return [
+        {
+          label: "Wrap",
+          run: async (onAccepted) => {
+            const hash = await sendTx({ to: WQ_ADDRESS, data: encodeWq("deposit", []), value: amountIn, abi: WQ_ABI });
+            recordTx(hash, `Wrap ${amount} Q`);
+            trackTxToast(hash, "wrap", { pending: "Wrapping", success: "Wrap complete", failure: "Wrap failed" }, `${amount} Q \u2192 WQ`);
+            onAccepted(hash);
+            await waitForReceiptSuccess(hash);
+            onSubmitted(hash);
+          },
+        },
+      ];
+    }
+    if (isUnwrap()) {
+      const amount = fromInput.getAmount();
+      return [
+        {
+          label: "Unwrap",
+          run: async (onAccepted) => {
+            const hash = await sendTx({ to: WQ_ADDRESS, data: encodeWq("withdraw", [amountIn]), value: 0n, abi: WQ_ABI });
+            recordTx(hash, `Unwrap ${amount} WQ`);
+            trackTxToast(hash, "wrap", { pending: "Unwrapping", success: "Unwrap complete", failure: "Unwrap failed" }, `${amount} WQ \u2192 Q`);
+            onAccepted(hash);
+            await waitForReceiptSuccess(hash);
+            onSubmitted(hash);
+          },
+        },
+      ];
+    }
+
+    const steps: TxStep[] = [];
+    if (!fromToken.isNative) {
+      const ap = await approvalStep({
+        tokenAddr: toPathAddress(fromToken),
+        symbol: fromToken.symbol,
+        abi: ERC20_ABI,
+        owner: account,
+        amount: amountIn,
+      });
+      if (ap) steps.push(ap);
+    }
+    steps.push({
+      label: "Swap",
+      run: async (onAccepted) => {
+        const slippage = settingsStore.get().slippagePercent;
+        const minOut = minWithSlippage(quotedOut, slippage);
+        const path = [toPathAddress(fromToken), toPathAddress(toToken)];
+        const ts = await getLatestBlockTimestamp();
+        const deadline = deadlineFrom(ts);
+        let data: string;
+        let value = 0n;
+        if (fromToken.isNative) {
+          data = encodeRouter("swapExactETHForTokens", [minOut, path, account, deadline]);
+          value = amountIn;
+        } else if (toToken.isNative) {
+          data = encodeRouter("swapExactTokensForETH", [amountIn, minOut, path, account, deadline]);
+        } else {
+          data = encodeRouter("swapExactTokensForTokens", [amountIn, minOut, path, account, deadline]);
+        }
+        const amount = fromInput.getAmount();
+        const outAmount = toInput.getAmount();
+        const hash = await sendTx({ to: ROUTER_ADDRESS, data, value, abi: ROUTER_ABI });
+        recordTx(hash, `Swap ${amount} ${fromToken.symbol} for ${toToken.symbol}`);
+        trackTxToast(
+          hash,
+          "swap",
+          { pending: "Swapping", success: "Swap complete", failure: "Swap failed" },
+          `${amount} ${fromToken.symbol} \u2192 ${outAmount ? `~${outAmount} ` : ""}${toToken.symbol}`,
+        );
+        onAccepted(hash);
+        await waitForReceiptSuccess(hash);
+        onSubmitted(hash);
+      },
+    });
+    return steps;
   }
 
   /** Clear the form after a submitted tx; the status toast is handled per action. */

@@ -66,6 +66,12 @@ export async function waitForReceipt(
   return null;
 }
 
+/** Resolve once a transaction is mined and successful; reject otherwise. */
+export async function waitForReceiptSuccess(hash: string): Promise<void> {
+  const receipt = await waitForReceipt(hash);
+  if (!receipt || receipt.status !== 1) throw new Error("Transaction was not confirmed on-chain");
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
