@@ -195,7 +195,7 @@ describe("findBestRoute", () => {
     expect(route).toBeNull();
   });
 
-  it("routes via the active release's WQ (custom release), not the original Beta 1 WQ", async () => {
+  it("routes via the active release's WQ (custom release), not the original Beta 2 WQ", async () => {
     const WQ2 = "0x" + "9".repeat(64);
     const FAC2 = "0x" + "8".repeat(64);
     const ROUT2 = "0x" + "7".repeat(64);
@@ -203,7 +203,7 @@ describe("findBestRoute", () => {
     expect(res.ok).toBe(true);
     setDefault(res.id as string);
 
-    // The active hub is now the custom WQ, not the Beta 1 WQ_ADDRESS.
+    // The active hub is now the custom WQ, not the Beta 2 WQ_ADDRESS.
     expect(wqAddress().toLowerCase()).toBe(WQ2.toLowerCase());
 
     setPools([
@@ -216,7 +216,7 @@ describe("findBestRoute", () => {
     const route = await findBestRoute(1_000_000n, HEI_TOKEN, Y2Q_TOKEN, 5);
     expect(route).not.toBeNull();
     expect(route!.path).toEqual([HEI.toLowerCase(), WQ2.toLowerCase(), Y2Q.toLowerCase()]);
-    // The original Beta 1 WQ must not appear in the path.
+    // The original Beta 2 WQ must not appear in the path.
     expect(route!.path).not.toContain(WQ_ADDRESS.toLowerCase());
   });
 
